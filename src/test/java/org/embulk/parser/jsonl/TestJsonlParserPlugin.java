@@ -62,6 +62,52 @@ public class TestJsonlParserPlugin
     }
 
     @Test
+    public void checkNormal()
+            throws Exception
+    {
+        SchemaConfig schema = schema(
+                column("_c0", BOOLEAN), column("_c1", LONG), column("_c2", DOUBLE),
+                column("_c3", STRING), column("_c4", TIMESTAMP, config().set("format", "%Y-%m-%d %H:%M:%S %Z")), column("_c5", JSON));
+        ConfigSource config = this.config.deepCopy().set("columns", schema);
+
+        transaction(config, fileInput(
+                "{\"_c0\":true,\"_c1\":10,\"_c2\":0.1,\"_c3\":\"embulk\",\"_c4\":\"2016-01-01 00:00:00 UTC\",\"_c5\":{\"k\":\"v\"}}",
+                "[1, 2, 3]", // this line should be skipped.
+                "{\n" +
+                        "\"_c0\":false,\n" +
+                        "\"_c1\":-10,\n" +
+                        "\"_c2\":1.0,\n" +
+                        "\"_c3\":\"エンバルク\",\n" +
+                        "\"_c4\":\"2016-01-01 00:00:00 +0000\",\n" +
+                        "\"_c5\":[\"e0\",\"e1\"]\n" +
+                "}"
+        ));
+
+        List<Object[]> records = Pages.toObjects(schema.toSchema(), output.pages);
+        assertEquals(2, records.size());
+
+        Object[] record;
+        {
+            record = records.get(0);
+            assertEquals(true, record[0]);
+            assertEquals(10L, record[1]);
+            assertEquals(0.1, (Double) record[2], 0.0001);
+            assertEquals("embulk", record[3]);
+            assertEquals(Timestamp.ofEpochSecond(1451606400L), record[4]);
+            assertEquals(newMap(newString("k"), newString("v")), record[5]);
+        }
+        {
+            record = records.get(1);
+            assertEquals(false, record[0]);
+            assertEquals(-10L, record[1]);
+            assertEquals(1.0, (Double) record[2], 0.0001);
+            assertEquals("エンバルク", record[3]);
+            assertEquals(Timestamp.ofEpochSecond(1451606400L), record[4]);
+            assertEquals(newArray(newString("e0"), newString("e1")), record[5]);
+        }
+    }
+
+    @Test
     public void skipRecords()
             throws Exception
     {
@@ -81,26 +127,6 @@ public class TestJsonlParserPlugin
 
         List<Object[]> records = Pages.toObjects(schema.toSchema(), output.pages);
         assertEquals(0, records.size());
-    }
-
-    @Test
-    public void throwDataException()
-            throws Exception
-    {
-        SchemaConfig schema = schema(
-                column("_c0", BOOLEAN), column("_c1", LONG), column("_c2", DOUBLE),
-                column("_c3", STRING), column("_c4", TIMESTAMP), column("_c5", JSON));
-        ConfigSource config = this.config.deepCopy().set("columns", schema).set("stop_on_invalid_record", true);
-
-        try {
-            transaction(config, fileInput(
-                    "\"not_map_value\""
-            ));
-            fail();
-        }
-        catch (Throwable t) {
-            assertTrue(t instanceof DataException);
-        }
     }
 
     @Test
