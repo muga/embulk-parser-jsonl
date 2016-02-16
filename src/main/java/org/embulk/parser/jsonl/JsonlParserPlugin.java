@@ -18,17 +18,20 @@ import org.embulk.spi.PageOutput;
 import org.embulk.spi.ParserPlugin;
 import org.embulk.spi.Schema;
 import org.embulk.spi.SchemaConfig;
+import org.embulk.spi.json.JsonParseException;
 import org.embulk.spi.json.JsonParser;
 import org.embulk.spi.time.TimestampParser;
-import org.embulk.spi.util.LineDecoder;
+import org.embulk.spi.util.FileInputInputStream;
 import org.embulk.spi.util.Timestamps;
 import org.msgpack.core.MessageTypeException;
 import org.msgpack.value.BooleanValue;
 import org.msgpack.value.FloatValue;
 import org.msgpack.value.IntegerValue;
 import org.msgpack.value.Value;
+import org.msgpack.value.ValueType;
 import org.slf4j.Logger;
 
+import java.io.IOException;
 import java.util.Map;
 
 import static org.msgpack.value.ValueFactory.newString;
@@ -37,7 +40,7 @@ public class JsonlParserPlugin
         implements ParserPlugin
 {
     public interface PluginTask
-            extends Task, LineDecoder.DecoderTask, TimestampParser.Task
+            extends Task, TimestampParser.Task
     {
         @Config("columns")
         @ConfigDefault("null")
@@ -55,8 +58,6 @@ public class JsonlParserPlugin
 
     private final Logger log;
 
-    private String line = null;
-    private long lineNumber = 0;
     private Map<String, Value> columnNameValues;
 
     public JsonlParserPlugin()
@@ -97,143 +98,144 @@ public class JsonlParserPlugin
         setColumnNameValues(schema);
 
         final TimestampParser[] timestampParsers = Timestamps.newTimestampColumnParsers(task, getSchemaConfig(task));
-        final LineDecoder decoder = newLineDecoder(input, task);
-        final JsonParser jsonParser = newJsonParser();
         final boolean stopOnInvalidRecord = task.getStopOnInvalidRecord();
 
-        try (final PageBuilder pageBuilder = new PageBuilder(Exec.getBufferAllocator(), schema, output)) {
-            while (decoder.nextFile()) { // TODO this implementation should be improved with new JsonParser API on Embulk v0.8.3
-                lineNumber = 0;
+        try (final PageBuilder pageBuilder = new PageBuilder(Exec.getBufferAllocator(), schema, output);
+                final FileInputInputStream in = new FileInputInputStream(input)) {
+            while (in.nextFile()) {
+                try (JsonParser.Stream stream = new JsonParser().open(in)) {
+                    Value value;
+                    while ((value = stream.next()) != null) {
+                        try {
+                            if (!value.isMapValue()) {
+                                throw new InvalidJsonLineException(value.getValueType());
+                            }
 
-                while ((line = decoder.poll()) != null) {
-                    lineNumber++;
+                            final Map<Value, Value> record = value.asMapValue().map();
 
-                    try {
-                        Value value = jsonParser.parse(line);
+                            schema.visitColumns(new ColumnVisitor()
+                            {
+                                @Override
+                                public void booleanColumn(Column column)
+                                {
+                                    Value v = record.get(getColumnNameValue(column));
+                                    if (isNil(v)) {
+                                        pageBuilder.setNull(column);
+                                    }
+                                    else {
+                                        try {
+                                            pageBuilder.setBoolean(column, ((BooleanValue) v).getBoolean());
+                                        }
+                                        catch (MessageTypeException e) {
+                                            throw new InvalidJsonValueException(e);
+                                        }
+                                    }
+                                }
 
-                        if (!value.isMapValue()) {
-                            throw new JsonRecordValidateException("Json string is not representing map value.");
+                                @Override
+                                public void longColumn(Column column)
+                                {
+                                    Value v = record.get(getColumnNameValue(column));
+                                    if (isNil(v)) {
+                                        pageBuilder.setNull(column);
+                                    }
+                                    else {
+                                        try {
+                                            pageBuilder.setLong(column, ((IntegerValue) v).asLong());
+                                        }
+                                        catch (MessageTypeException e) {
+                                            throw new InvalidJsonValueException(e);
+                                        }
+                                    }
+                                }
+
+                                @Override
+                                public void doubleColumn(Column column)
+                                {
+                                    Value v = record.get(getColumnNameValue(column));
+                                    if (isNil(v)) {
+                                        pageBuilder.setNull(column);
+                                    }
+                                    else {
+                                        try {
+                                            pageBuilder.setDouble(column, ((FloatValue) v).toDouble());
+                                        }
+                                        catch (MessageTypeException e) {
+                                            throw new InvalidJsonValueException(e);
+                                        }
+                                    }
+                                }
+
+                                @Override
+                                public void stringColumn(Column column)
+                                {
+                                    Value v = record.get(getColumnNameValue(column));
+                                    if (isNil(v)) {
+                                        pageBuilder.setNull(column);
+                                    }
+                                    else {
+                                        try {
+                                            pageBuilder.setString(column, v.toString());
+                                        }
+                                        catch (MessageTypeException e) {
+                                            throw new InvalidJsonValueException(e);
+                                        }
+                                    }
+                                }
+
+                                @Override
+                                public void timestampColumn(Column column)
+                                {
+                                    Value v = record.get(getColumnNameValue(column));
+                                    if (isNil(v)) {
+                                        pageBuilder.setNull(column);
+                                    }
+                                    else {
+                                        try {
+                                            pageBuilder.setTimestamp(column, timestampParsers[column.getIndex()].parse(v.toString()));
+                                        }
+                                        // TODO parse error handling
+                                        catch (MessageTypeException e) {
+                                            throw new InvalidJsonValueException(e);
+                                        }
+                                    }
+                                }
+
+                                @Override
+                                public void jsonColumn(Column column)
+                                {
+                                    Value v = record.get(getColumnNameValue(column));
+                                    if (isNil(v)) {
+                                        pageBuilder.setNull(column);
+                                    }
+                                    else {
+                                        try {
+                                            pageBuilder.setJson(column, v);
+                                        }
+                                        catch (MessageTypeException e) {
+                                            throw new InvalidJsonValueException(e);
+                                        }
+                                    }
+                                }
+
+                                private boolean isNil(Value v)
+                                {
+                                    return v == null || v.isNilValue();
+                                }
+                            });
+
+                            pageBuilder.addRecord();
                         }
-
-                        final Map<Value, Value> record = value.asMapValue().map();
-
-                        schema.visitColumns(new ColumnVisitor() {
-                            @Override
-                            public void booleanColumn(Column column)
-                            {
-                                Value v = record.get(getColumnNameValue(column));
-                                if (isNil(v)) {
-                                    pageBuilder.setNull(column);
-                                }
-                                else {
-                                    try {
-                                        pageBuilder.setBoolean(column, ((BooleanValue) v).getBoolean());
-                                    }
-                                    catch (MessageTypeException e) {
-                                        throw new JsonRecordValidateException(e);
-                                    }
-                                }
+                        catch (InvalidJsonLineException e) {
+                            if (stopOnInvalidRecord) {
+                                throw new DataException(String.format("Invalid record: %s", value.toJson()), e);
                             }
-
-                            @Override
-                            public void longColumn(Column column)
-                            {
-                                Value v = record.get(getColumnNameValue(column));
-                                if (isNil(v)) {
-                                    pageBuilder.setNull(column);
-                                }
-                                else {
-                                    try {
-                                        pageBuilder.setLong(column, ((IntegerValue) v).asLong());
-                                    }
-                                    catch (MessageTypeException e) {
-                                        throw new JsonRecordValidateException(e);
-                                    }
-                                }
-                            }
-
-                            @Override
-                            public void doubleColumn(Column column)
-                            {
-                                Value v = record.get(getColumnNameValue(column));
-                                if (isNil(v)) {
-                                    pageBuilder.setNull(column);
-                                }
-                                else {
-                                    try {
-                                        pageBuilder.setDouble(column, ((FloatValue) v).toDouble());
-                                    }
-                                    catch (MessageTypeException e) {
-                                        throw new JsonRecordValidateException(e);
-                                    }
-                                }
-                            }
-
-                            @Override
-                            public void stringColumn(Column column)
-                            {
-                                Value v = record.get(getColumnNameValue(column));
-                                if (isNil(v)) {
-                                    pageBuilder.setNull(column);
-                                }
-                                else {
-                                    try {
-                                        pageBuilder.setString(column, v.toString());
-                                    }
-                                    catch (MessageTypeException e) {
-                                        throw new JsonRecordValidateException(e);
-                                    }
-                                }
-                            }
-
-                            @Override
-                            public void timestampColumn(Column column)
-                            {
-                                Value v = record.get(getColumnNameValue(column));
-                                if (isNil(v)) {
-                                    pageBuilder.setNull(column);
-                                }
-                                else {
-                                    try {
-                                        pageBuilder.setTimestamp(column, timestampParsers[column.getIndex()].parse(v.toString()));
-                                    }
-                                    catch (MessageTypeException e) {
-                                        throw new JsonRecordValidateException(e);
-                                    }
-                                }
-                            }
-
-                            @Override
-                            public void jsonColumn(Column column)
-                            {
-                                Value v = record.get(getColumnNameValue(column));
-                                if (isNil(v)) {
-                                    pageBuilder.setNull(column);
-                                }
-                                else {
-                                    try {
-                                        pageBuilder.setJson(column, v);
-                                    }
-                                    catch (MessageTypeException e) {
-                                        throw new JsonRecordValidateException(e);
-                                    }
-                                }
-                            }
-
-                            private boolean isNil(Value v)
-                            {
-                                return v == null || v.isNilValue();
-                            }
-                        });
-
-                        pageBuilder.addRecord();
-                    }
-                    catch (JsonRecordValidateException e) {
-                        if (stopOnInvalidRecord) {
-                            throw new DataException(String.format("Invalid record at line %d: %s", lineNumber, line), e);
+                            log.warn(String.format("Skipped line: %s", value.toJson()), e);
                         }
-                        log.warn(String.format("Skipped line %d (%s): %s", lineNumber, e.getMessage(), line));
                     }
+                }
+                catch (IOException | JsonParseException e) {
+                    throw new DataException(e);
                 }
             }
 
@@ -256,16 +258,6 @@ public class JsonlParserPlugin
         return columnNameValues.get(column.getName());
     }
 
-    public LineDecoder newLineDecoder(FileInput input, PluginTask task)
-    {
-        return new LineDecoder(input, task);
-    }
-
-    public JsonParser newJsonParser()
-    {
-        return new JsonParser();
-    }
-
     static class JsonRecordValidateException
             extends DataException
     {
@@ -275,6 +267,24 @@ public class JsonlParserPlugin
         }
 
         JsonRecordValidateException(Throwable cause)
+        {
+            super(cause);
+        }
+    }
+
+    static class InvalidJsonLineException
+            extends JsonRecordValidateException
+    {
+        InvalidJsonLineException(ValueType valueType)
+        {
+            super(String.format("Json line must not represent map value but it's %s", valueType.name()));
+        }
+    }
+
+    static class InvalidJsonValueException
+            extends JsonRecordValidateException
+    {
+        InvalidJsonValueException(Throwable cause)
         {
             super(cause);
         }
